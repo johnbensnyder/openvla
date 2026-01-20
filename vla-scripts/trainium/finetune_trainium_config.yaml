@@ -1,0 +1,40 @@
+# Example configuration for OpenVLA LIBERO fine-tuning on AWS Trainium
+# Usage: torchrun --nproc_per_node=8 vla-scripts/trainium/finetune_libero_trainium.py --config vla-scripts/trainium/finetune_trainium_config.yaml
+
+# Model
+vla_path: openvla/openvla-7b
+
+# Data
+data_root_dir: datasets/modified_libero_rlds
+task_suites: libero_spatial  # Options: libero_spatial, libero_object, libero_goal, libero_10
+
+# Output
+run_root_dir: runs_trainium
+
+# Trainium-specific
+tensor_parallel_size: 8  # TP=8 for 7B model on trn1.32xlarge
+neuron_compile_cache_dir: /home/ubuntu/neuron_cache  # Optional: persistent compile cache
+
+# Training (from OpenVLA paper Appendix E)
+batch_size: 4
+max_steps: 50000
+save_steps: 5000
+learning_rate: 5e-4
+grad_accumulation_steps: 1
+image_aug: true
+shuffle_buffer_size: 100000
+
+# LoRA
+lora_rank: 32
+lora_alpha: 16
+lora_dropout: 0.0
+
+# Validation (runs on CPU)
+val_frequency: 1000
+val_episodes: 10
+center_crop: true
+
+# Logging
+use_wandb: false
+wandb_project: openvla-libero-trainium
+wandb_entity: null

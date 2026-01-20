@@ -1,0 +1,32 @@
+# Requirements for OpenVLA fine-tuning on AWS Trainium
+# Install on Neuron DLAMI (Ubuntu 22) with PyTorch NeuronX pre-installed
+
+# Neuron SDK packages (install via Neuron pip repo)
+# pip install --extra-index-url https://pip.repos.neuron.amazonaws.com
+neuronx-distributed>=0.9.0
+torch-neuronx>=2.1.0
+
+# OpenVLA dependencies
+transformers==4.40.1
+tokenizers==0.19.1
+timm==0.9.10
+draccus>=0.8.0
+accelerate>=0.25.0
+
+# Data loading
+tensorflow-datasets==4.9.3
+dlimp @ git+https://github.com/moojink/dlimp_openvla
+
+# LIBERO simulation (for CPU validation)
+robosuite
+mujoco
+
+# Logging
+tensorboard
+wandb
+
+# Utilities
+tqdm
+Pillow
+imageio
+imageio-ffmpeg

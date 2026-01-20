@@ -4,12 +4,18 @@ finetune_libero_demo.py
 Demo script for LoRA fine-tuning OpenVLA on LIBERO with periodic validation rollouts
 and TensorBoard video logging. Replicates Appendix E of the OpenVLA paper.
 
-Usage:
+Usage (CLI args):
     torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune_libero_demo.py \
         --data_root_dir ./datasets/modified_libero_rlds \
         --task_suites libero_spatial \
         --val_frequency 500 \
         --run_root_dir ./runs
+
+Usage (YAML config):
+    torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune_libero_demo.py \
+        --config config.yaml
+
+    CLI args override YAML values when both are provided.
 """
 
 import os
@@ -58,6 +64,9 @@ SUITE_TO_DATASET = {
 
 @dataclass
 class FinetuneConfig:
+    # Config file (optional - CLI args override YAML values)
+    config: Optional[Path] = None
+    
     # Model
     vla_path: str = "openvla/openvla-7b"
     
@@ -85,6 +94,7 @@ class FinetuneConfig:
     val_episodes: int = 10
     num_videos: int = 5
     center_crop: bool = True
+    save_video_files: bool = False  # Save validation videos as MP4 files
     
     # Training rollouts (0 = disabled)
     train_rollout_frequency: int = 0
@@ -107,7 +117,24 @@ def log_videos(tracker: TensorBoardTracker, videos_dict: dict, step: int, prefix
             video_idx += 1
 
 
-def run_validation(model, processor, cfg, task_suites, tracker, step, device_id, dataset_stats):
+def save_videos_to_files(videos_dict: dict, output_dir: Path, step: int, prefix: str = "val"):
+    """Save rollout videos as MP4 files."""
+    import imageio
+    video_dir = output_dir / "videos" / f"step_{step:06d}"
+    video_dir.mkdir(parents=True, exist_ok=True)
+    
+    video_idx = 0
+    for task_name, task_videos in videos_dict.items():
+        for frames, success in task_videos:
+            status = "success" if success else "fail"
+            filename = f"{prefix}_{video_idx:02d}_{task_name[:30]}_{status}.mp4"
+            filepath = video_dir / filename
+            imageio.mimwrite(str(filepath), frames, fps=30)
+            video_idx += 1
+    print(f"  Saved {video_idx} videos to {video_dir}")
+
+
+def run_validation(model, processor, cfg, task_suites, tracker, step, device_id, dataset_stats, run_dir):
     """Run validation rollouts and log results."""
     print(f"\n[Step {step}] Running validation rollouts...")
     
@@ -141,6 +168,8 @@ def run_validation(model, processor, cfg, task_suites, tracker, step, device_id,
     
     # Log videos
     log_videos(tracker, all_videos, step, prefix="val")
+    if cfg.save_video_files:
+        save_videos_to_files(all_videos, run_dir, step, prefix="val")
     tracker.flush()
     
     # Set model back to training mode
@@ -345,7 +374,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Validation
             if step > 0 and step % cfg.val_frequency == 0:
                 if distributed_state.is_main_process:
-                    run_validation(vla, processor, cfg, task_suites, tracker, step, device_id, vla_dataset.dataset_statistics)
+                    run_validation(vla, processor, cfg, task_suites, tracker, step, device_id, vla_dataset.dataset_statistics, run_dir)
                 if use_ddp:
                     dist.barrier()
             
@@ -380,7 +409,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Final validation
     if distributed_state.is_main_process:
         print("\nRunning final validation...")
-        run_validation(vla, processor, cfg, task_suites, tracker, cfg.max_steps, device_id, vla_dataset.dataset_statistics)
+        run_validation(vla, processor, cfg, task_suites, tracker, cfg.max_steps, device_id, vla_dataset.dataset_statistics, run_dir)
     
     tracker.finalize()
     if cfg.use_wandb and distributed_state.is_main_process:

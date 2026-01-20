@@ -1,0 +1,41 @@
+# Example configuration for finetune_libero_demo.py
+# Usage: torchrun ... vla-scripts/finetune_libero_demo.py --config vla-scripts/finetune_libero_config.yaml
+
+# Model
+vla_path: openvla/openvla-7b
+
+# Data
+data_root_dir: datasets/modified_libero_rlds
+task_suites: libero_spatial  # Comma-separated: libero_spatial,libero_object,libero_goal,libero_10
+
+# Output
+run_root_dir: runs
+adapter_tmp_dir: adapter-tmp
+
+# Training (from paper Appendix E)
+batch_size: 4
+max_steps: 50000
+save_steps: 5000
+learning_rate: 5e-4
+grad_accumulation_steps: 1
+image_aug: true
+shuffle_buffer_size: 100000
+lora_rank: 32
+lora_dropout: 0.0
+
+# Validation
+val_frequency: 1000
+val_episodes: 10
+num_videos: 5
+center_crop: true
+save_video_files: false  # Save validation videos as MP4 files to run_root_dir/videos/
+
+# Training rollouts (0 = disabled)
+train_rollout_frequency: 0
+train_rollout_episodes: 5
+train_rollout_videos: 2
+
+# Logging
+use_wandb: false
+wandb_project: openvla-libero
+wandb_entity: null
