@@ -29,7 +29,6 @@ import tqdm
 
 # XLA imports for Trainium
 import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_backend
 
 import neuronx_distributed as nxd
@@ -65,8 +64,8 @@ class TrainiumFinetuneConfig:
     # Config file (optional)
     config: Optional[Path] = None
     
-    # Model
-    vla_path: str = "openvla/openvla-7b"
+    # Model - VLA-Adapter 0.5B (Qwen2.5 backbone, HuggingFace compatible)
+    vla_path: str = "VLA-Adapter/LIBERO-Spatial"
     
     # Data
     data_root_dir: Path = Path("datasets/modified_libero_rlds")
@@ -75,11 +74,13 @@ class TrainiumFinetuneConfig:
     # Output
     run_root_dir: Path = Path("runs_trainium")
     
-    # Trainium-specific
-    tensor_parallel_size: int = 8
+    # Trainium-specific - VLA-Adapter 0.5B fits on single core
+    tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+    num_microbatches: int = 1
     neuron_compile_cache_dir: Optional[str] = None
     
-    # Training
+    # Training - small model allows larger batches
     batch_size: int = 4
     max_steps: int = 50000
     save_steps: int = 5000
@@ -89,14 +90,18 @@ class TrainiumFinetuneConfig:
     shuffle_buffer_size: int = 100000
     
     # LoRA
-    lora_rank: int = 32
+    lora_rank: int = 16
     lora_alpha: int = 16
     lora_dropout: float = 0.0
     
     # Validation
     val_frequency: int = 1000
-    val_episodes: int = 10
+    val_episodes: int = 1
+    val_videos: int = 1
     center_crop: bool = True
+    
+    # Background workers (non-blocking checkpoint/validation)
+    background_workers: bool = True
     
     # Logging
     use_wandb: bool = False
@@ -187,14 +192,16 @@ def finetune(cfg: TrainiumFinetuneConfig) -> None:
         assert suite in SUITE_TO_DATASET, f"Unknown task suite: {suite}"
     
     # Initialize XLA distributed
+    import torch_xla.runtime as xr
+    import torch_xla
     torch.distributed.init_process_group("xla")
-    world_size = xm.xrt_world_size()
-    rank = xm.get_ordinal()
-    device = xm.xla_device()
+    world_size = xr.world_size()
+    rank = xr.global_ordinal()
+    device = torch_xla.device()
     
     if xm.is_master_ordinal():
         print(f"Fine-tuning OpenVLA on Trainium: {task_suites}")
-        print(f"World size: {world_size}, TP size: {cfg.tensor_parallel_size}")
+        print(f"World size: {world_size}, TP: {cfg.tensor_parallel_size}, PP: {cfg.pipeline_parallel_size}")
     
     # Initialize NxD parallel state
     nxd.parallel_layers.initialize_model_parallel(
@@ -203,7 +210,7 @@ def finetune(cfg: TrainiumFinetuneConfig) -> None:
     
     # Experiment ID
     suites_str = "+".join(task_suites)
-    exp_id = f"trainium-libero-{suites_str}+lora-r{cfg.lora_rank}+tp{cfg.tensor_parallel_size}"
+    exp_id = f"trainium-libero-{suites_str}+lora-r{cfg.lora_rank}+tp{cfg.tensor_parallel_size}+pp{cfg.pipeline_parallel_size}"
     if cfg.image_aug:
         exp_id += "+aug"
     
@@ -212,24 +219,28 @@ def finetune(cfg: TrainiumFinetuneConfig) -> None:
         os.makedirs(run_dir, exist_ok=True)
     xm.rendezvous("mkdir")
     
-    # Register OpenVLA config
+    # Register OpenVLA config for processor loading
     AutoConfig.register("openvla", OpenVLAConfig)
     AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     
-    # Load processor
+    # Load processor - use OpenVLA processor (compatible with MiniVLA)
+    # MiniVLA Prismatic checkpoints don't have HF-compatible config
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
     
-    # Load model with NxD tensor parallelism and LoRA
+    # Load model with NxD LoRA
     from openvla_nxd import load_openvla_for_trainium
     
     model = load_openvla_for_trainium(
         vla_path=cfg.vla_path,
         tensor_parallel_size=cfg.tensor_parallel_size,
+        pipeline_parallel_size=cfg.pipeline_parallel_size,
+        num_microbatches=cfg.num_microbatches,
         lora_rank=cfg.lora_rank,
         lora_alpha=cfg.lora_alpha,
         lora_dropout=cfg.lora_dropout,
     )
+    # Move entire model to device (VLA-Adapter 0.5B fits easily)
     model = model.to(device)
     
     if xm.is_master_ordinal():
@@ -261,9 +272,10 @@ def finetune(cfg: TrainiumFinetuneConfig) -> None:
     if xm.is_master_ordinal():
         save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
     
-    # DataLoader with XLA parallel loader
+    # DataLoader - use shorter max length to reduce memory (LIBERO prompts are short)
+    max_seq_len = 256
     collator = PaddedCollatorForActionPrediction(
-        processor.tokenizer.model_max_length,
+        max_seq_len,
         processor.tokenizer.pad_token_id,
         padding_side="right",
     )
@@ -275,10 +287,9 @@ def finetune(cfg: TrainiumFinetuneConfig) -> None:
         num_workers=0,
     )
     
-    # Wrap with XLA parallel loader for efficient data transfer
-    para_loader = pl.ParallelLoader(dataloader, [device])
-    device_loader = para_loader.per_device_loader(device)
-    
+    # Note: Not using ParallelLoader since we need to process pixel_values on CPU
+    # before transferring other tensors to device
+
     # Initialize tracker
     if xm.is_master_ordinal():
         hparams = draccus.encode(cfg)
@@ -288,6 +299,25 @@ def finetune(cfg: TrainiumFinetuneConfig) -> None:
         if cfg.use_wandb:
             import wandb
             wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=exp_id, config=hparams)
+    
+    # Initialize background workers for non-blocking checkpoint/validation
+    bg_workers = None
+    if cfg.background_workers:
+        from background_workers import BackgroundWorkersManager
+        unnorm_keys = {suite: SUITE_TO_DATASET[suite] for suite in task_suites}
+        bg_workers = BackgroundWorkersManager(
+            run_dir=run_dir,
+            vla_path=cfg.vla_path,
+            task_suites=task_suites,
+            unnorm_keys=unnorm_keys,
+            dataset_stats=vla_dataset.dataset_statistics,
+            val_episodes=cfg.val_episodes,
+            val_videos=cfg.val_videos,
+            center_crop=cfg.center_crop,
+        )
+        if xm.is_master_ordinal():
+            bg_workers.start()
+            print("Background workers started for async checkpoint/validation")
     
     # Training metrics
     recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
@@ -300,15 +330,24 @@ def finetune(cfg: TrainiumFinetuneConfig) -> None:
     model.train()
     optimizer.zero_grad()
     
+    # Get num_patches for accuracy calculation
+    num_patches = model.vision_backbone.featurizer.patch_embed.num_patches
+    
     pbar = tqdm.tqdm(total=cfg.max_steps, disable=not xm.is_master_ordinal())
     
-    for batch_idx, batch in enumerate(device_loader):
+    for batch_idx, batch in enumerate(dataloader):
+        # Move batch to device
+        pixel_values = batch["pixel_values"].to(device)
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+        
         # Forward pass
         output = model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            pixel_values=batch["pixel_values"].to(torch.bfloat16),
-            labels=batch["labels"],
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            labels=labels,
         )
         loss = output.loss
         
@@ -316,16 +355,18 @@ def finetune(cfg: TrainiumFinetuneConfig) -> None:
         scaled_loss = loss / cfg.grad_accumulation_steps
         scaled_loss.backward()
         
-        # Compute accuracy (on CPU to avoid XLA graph issues)
+        # Compute accuracy and free memory
         with torch.no_grad():
-            num_patches = model.vision_backbone.featurizer.patch_embed.num_patches
             action_logits = output.logits[:, num_patches:-1]
             action_preds = action_logits.argmax(dim=2)
-            action_gt = batch["labels"][:, 1:].to(action_preds.device)
+            action_gt = labels[:, 1:]
             mask = action_gt > action_tokenizer.action_token_begin_idx
             correct = ((action_preds == action_gt) & mask).sum()
             total = mask.sum()
             accuracy = (correct.float() / total.float()).item()
+        
+        # Free memory from forward pass
+        del output, action_logits, action_preds, pixel_values, input_ids, attention_mask, labels
         
         recent_losses.append(loss.item())
         recent_accuracies.append(accuracy)
@@ -353,37 +394,27 @@ def finetune(cfg: TrainiumFinetuneConfig) -> None:
                     import wandb
                     wandb.log({"train/loss": avg_loss, "train/action_accuracy": avg_acc}, step=step)
                 pbar.set_postfix(loss=f"{avg_loss:.4f}", acc=f"{avg_acc:.2%}")
+                
+                # Check for background validation results
+                if bg_workers:
+                    val_results = bg_workers.get_validation_results()
+                    if val_results:
+                        metrics = {f"val/success_rate/{s}": r for s, r in val_results["success_rates"].items()}
+                        metrics["val/success_rate/mean"] = sum(val_results["success_rates"].values()) / len(val_results["success_rates"])
+                        tracker.write(val_results["step"], metrics)
+                        if cfg.use_wandb:
+                            wandb.log(metrics, step=val_results["step"])
         
-        # Validation
-        if step > 0 and step % cfg.val_frequency == 0 and (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
-            xm.rendezvous("pre_validation")
-            
-            if xm.is_master_ordinal():
-                # Save temporary checkpoint for CPU validation
-                temp_ckpt = save_checkpoint(model, optimizer, run_dir, step)
-                
-                # Run validation on CPU
-                success_rates = run_cpu_validation(
-                    temp_ckpt, processor, task_suites, cfg, step, vla_dataset.dataset_statistics
-                )
-                
-                # Log validation metrics
-                metrics = {f"val/success_rate/{suite}": rate for suite, rate in success_rates.items()}
-                metrics["val/success_rate/mean"] = sum(success_rates.values()) / len(success_rates)
-                tracker.write(step, metrics)
-                
-                if cfg.use_wandb:
-                    import wandb
-                    wandb.log(metrics, step=step)
-            
-            xm.rendezvous("post_validation")
-            model.train()
-        
-        # Save checkpoint
+        # Checkpoint and validation (background or blocking)
         if step > 0 and step % cfg.save_steps == 0 and (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
-            xm.rendezvous("pre_checkpoint")
-            save_checkpoint(model, optimizer, run_dir, step)
-            xm.rendezvous("post_checkpoint")
+            if bg_workers:
+                # Non-blocking: gather weights and submit to background workers
+                bg_workers.submit(model, step, cfg.tensor_parallel_size)
+            else:
+                # Blocking: save checkpoint synchronously
+                xm.rendezvous("pre_checkpoint")
+                save_checkpoint(model, optimizer, run_dir, step)
+                xm.rendezvous("post_checkpoint")
         
         # Check termination
         if step >= cfg.max_steps:
@@ -393,25 +424,29 @@ def finetune(cfg: TrainiumFinetuneConfig) -> None:
     
     # Final checkpoint
     xm.rendezvous("final_checkpoint")
-    save_checkpoint(model, optimizer, run_dir, cfg.max_steps)
+    if bg_workers:
+        bg_workers.submit(model, cfg.max_steps, cfg.tensor_parallel_size)
+    else:
+        save_checkpoint(model, optimizer, run_dir, cfg.max_steps)
     
-    # Final validation
+    # Stop background workers and finalize
+    if bg_workers and xm.is_master_ordinal():
+        # Wait for final validation result
+        import time
+        for _ in range(60):  # Wait up to 60 seconds
+            val_results = bg_workers.get_validation_results()
+            if val_results:
+                metrics = {f"val/success_rate/{s}": r for s, r in val_results["success_rates"].items()}
+                tracker.write(val_results["step"], metrics)
+                break
+            time.sleep(1)
+        bg_workers.stop()
+    
     if xm.is_master_ordinal():
-        print("\nRunning final validation...")
-        final_ckpt = run_dir / f"checkpoint-{cfg.max_steps}"
-        success_rates = run_cpu_validation(
-            final_ckpt, processor, task_suites, cfg, cfg.max_steps, vla_dataset.dataset_statistics
-        )
-        
-        tracker.write(cfg.max_steps, {
-            f"val/success_rate/{suite}": rate for suite, rate in success_rates.items()
-        })
         tracker.finalize()
-        
         if cfg.use_wandb:
             import wandb
             wandb.finish()
-        
         print(f"\nTraining complete! Logs at: {run_dir}/tensorboard")
 
 

@@ -1,24 +1,22 @@
 """
 openvla_nxd.py
 
-OpenVLA model wrapper for NeuronX Distributed (NxD) tensor parallelism on Trainium.
-Applies tensor parallelism to the LLM backbone and NxD LoRA to linear layers.
+MiniVLA/OpenVLA model wrapper for NeuronX Distributed (NxD) on Trainium.
+Supports both OpenVLA (Llama-7B) and MiniVLA (Qwen2.5-0.5B) backbones.
 """
 
 import torch
 import torch.nn as nn
-from typing import Optional, List, Tuple
+from typing import Optional
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import neuronx_distributed as nxd
-from neuronx_distributed.parallel_layers import layers as nxd_layers
 from neuronx_distributed.modules.lora import LoraConfig as NxDLoraConfig
 
 
 def get_nxd_lora_config(lora_rank: int = 32, lora_alpha: int = 16, lora_dropout: float = 0.0):
-    """Create NxD LoRA configuration for OpenVLA LLM backbone."""
+    """Create NxD LoRA configuration for VLA LLM backbone."""
     return NxDLoraConfig(
-        enable_lora=True,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
@@ -32,18 +30,22 @@ def get_nxd_lora_config(lora_rank: int = 32, lora_alpha: int = 16, lora_dropout:
 
 class OpenVLAForTrainium(nn.Module):
     """
-    OpenVLA model adapted for Trainium with tensor parallelism.
+    OpenVLA/MiniVLA model adapted for Trainium.
     
     Architecture:
-    - Vision backbone: Runs on single device (not parallelized)
-    - Projector: Runs on single device
-    - LLM backbone: Tensor-parallelized across NeuronCores with NxD LoRA
+    - Vision backbone: Runs on CPU (not parallelized)
+    - Projector: Runs on CPU
+    - LLM backbone: On device with NxD LoRA
+    
+    Supports both OpenVLA (Llama-7B) and MiniVLA (Qwen2.5-0.5B).
     """
     
     def __init__(
         self,
         vla_path: str,
-        tensor_parallel_size: int = 8,
+        tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
+        num_microbatches: int = 1,
         lora_rank: int = 32,
         lora_alpha: int = 16,
         lora_dropout: float = 0.0,
@@ -60,7 +62,7 @@ class OpenVLAForTrainium(nn.Module):
         config = AutoConfig.from_pretrained(vla_path, trust_remote_code=True)
         self.config = config
         
-        # Vision backbone - not parallelized (relatively small)
+        # Vision backbone - runs on CPU
         self.vision_backbone = PrismaticVisionBackbone(
             config.use_fused_vision_backbone,
             config.image_sizes,
@@ -68,39 +70,83 @@ class OpenVLAForTrainium(nn.Module):
             config.timm_override_act_layers,
         )
         
-        # Projector - not parallelized
+        # Projector - runs on CPU
         self.projector = PrismaticProjector(
             config.use_fused_vision_backbone,
             vision_dim=self.vision_backbone.embed_dim,
             llm_dim=config.text_config.hidden_size,
         )
         
-        # LLM backbone with NxD tensor parallelism and LoRA
+        # Detect LLM type from config
+        llm_type = config.text_config.model_type
+        print(f"Detected LLM backbone: {llm_type}")
+        
+        # LLM backbone with NxD LoRA
         lora_config = get_nxd_lora_config(lora_rank, lora_alpha, lora_dropout)
         
         nxd_config = nxd.neuronx_distributed_config(
-            tensor_parallel_size=tensor_parallel_size,
+            tensor_parallel_size=1,  # MiniVLA fits on single core
+            pipeline_parallel_size=1,
             lora_config=lora_config,
         )
         
-        # Initialize LLM with tensor parallelism
-        self.language_model = nxd.initialize_parallel_model(
-            nxd_config,
-            model_fn=lambda: AutoModelForCausalLM.from_pretrained(
-                vla_path,
-                subfolder="language_model" if hasattr(config, 'text_config') else None,
-                config=config.text_config,
-                torch_dtype=torch.bfloat16,
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
-            ),
-        )
+        # Initialize LLM based on backbone type
+        if llm_type == "qwen2":
+            from transformers import Qwen2ForCausalLM
+            self.language_model = nxd.initialize_parallel_model(
+                nxd_config,
+                model_fn=lambda: Qwen2ForCausalLM(config.text_config).to(torch.bfloat16),
+            )
+        else:  # Default to Llama for OpenVLA
+            from transformers import LlamaForCausalLM
+            self.language_model = nxd.initialize_parallel_model(
+                nxd_config,
+                model_fn=lambda: LlamaForCausalLM(config.text_config).to(torch.bfloat16),
+            )
         
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = config.pad_token_id
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.llm_type = llm_type
         
         # For action un-normalization during inference
         self.norm_stats = None
+        
+    def load_pretrained_weights(self, vla_path: str):
+        """Load pretrained weights from VLA checkpoint."""
+        from safetensors.torch import load_file
+        from huggingface_hub import hf_hub_download
+        import json
+        
+        # Try sharded format first, fall back to single file
+        try:
+            index_file = hf_hub_download(vla_path, "model.safetensors.index.json")
+            with open(index_file) as f:
+                index = json.load(f)
+            shard_files = set(index["weight_map"].values())
+            state_dict = {}
+            for shard in shard_files:
+                shard_path = hf_hub_download(vla_path, shard)
+                state_dict.update(load_file(shard_path))
+        except Exception:
+            # Single file format
+            model_file = hf_hub_download(vla_path, "model.safetensors")
+            state_dict = load_file(model_file)
+        
+        # Load vision backbone weights
+        vision_state = {k.replace("vision_backbone.", ""): v for k, v in state_dict.items() 
+                       if k.startswith("vision_backbone.")}
+        self.vision_backbone.load_state_dict(vision_state, strict=False)
+        
+        # Load projector weights
+        proj_state = {k.replace("projector.", ""): v for k, v in state_dict.items()
+                     if k.startswith("projector.")}
+        self.projector.load_state_dict(proj_state, strict=False)
+        
+        # Load LLM weights
+        llm_state = {k.replace("language_model.", ""): v for k, v in state_dict.items()
+                    if k.startswith("language_model.")}
+        self.language_model.load_state_dict(llm_state, strict=False)
         
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
@@ -130,11 +176,16 @@ class OpenVLAForTrainium(nn.Module):
         attention_mask: torch.Tensor,
         pixel_values: torch.FloatTensor,
         labels: Optional[torch.LongTensor] = None,
+        projected_patch_embeddings: Optional[torch.Tensor] = None,
     ):
-        """Forward pass for training."""
-        # Visual feature extraction (not parallelized)
-        patch_features = self.vision_backbone(pixel_values)
-        projected_patch_embeddings = self.projector(patch_features)
+        """Forward pass for training.
+        
+        If projected_patch_embeddings is provided, skip vision encoding (for CPU offload).
+        """
+        if projected_patch_embeddings is None:
+            # Visual feature extraction (not parallelized)
+            patch_features = self.vision_backbone(pixel_values)
+            projected_patch_embeddings = self.projector(patch_features)
         
         # Get input embeddings from LLM
         input_embeddings = self.get_input_embeddings()(input_ids)
@@ -192,29 +243,24 @@ class OpenVLAForTrainium(nn.Module):
 def load_openvla_for_trainium(
     vla_path: str,
     tensor_parallel_size: int = 8,
+    pipeline_parallel_size: int = 1,
+    num_microbatches: int = 1,
     lora_rank: int = 32,
     lora_alpha: int = 16,
     lora_dropout: float = 0.0,
 ) -> OpenVLAForTrainium:
     """
-    Load OpenVLA model configured for Trainium training.
-    
-    Args:
-        vla_path: HuggingFace model path (e.g., "openvla/openvla-7b")
-        tensor_parallel_size: Number of tensor parallel ranks (default: 8)
-        lora_rank: LoRA rank (default: 32)
-        lora_alpha: LoRA alpha scaling (default: 16)
-        lora_dropout: LoRA dropout (default: 0.0)
-        
-    Returns:
-        OpenVLAForTrainium model with LoRA enabled
+    Load VLA model configured for Trainium training.
     """
     model = OpenVLAForTrainium(
         vla_path=vla_path,
         tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        num_microbatches=num_microbatches,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
     )
+    model.load_pretrained_weights(vla_path)
     model.freeze_non_lora_params()
     return model

@@ -1,0 +1,23 @@
+# Requirements for SageMaker Neuron DLC
+# Neuron SDK packages are provided by the DLC - do not include here
+
+# OpenVLA dependencies
+transformers==4.40.1
+tokenizers==0.19.1
+timm==0.9.10
+draccus>=0.8.0
+accelerate>=0.25.0
+
+# Data loading
+tensorflow>=2.16
+tensorflow-datasets>=4.9.3
+tensorflow-graphics
+dlimp @ git+https://github.com/kvablack/dlimp
+
+# Utilities
+tqdm
+Pillow
+imageio
+imageio-ffmpeg
+jsonlines
+safetensors
