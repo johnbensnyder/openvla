@@ -83,6 +83,7 @@ class FinetuneConfig:
     # Validation
     val_frequency: int = 1000
     val_episodes: int = 10
+    val_loss_batches: int = 50
     num_videos: int = 5
     center_crop: bool = True
     
@@ -105,6 +106,39 @@ def log_videos(tracker: TensorBoardTracker, videos_dict: dict, step: int, prefix
             tag = f"{prefix}_videos/{video_idx}_{task_name[:30]}_{'success' if success else 'fail'}"
             tracker.write_video(tag, frames, step, fps=30)
             video_idx += 1
+
+
+def compute_val_loss(model, val_dataloader, device_id, action_tokenizer, get_model_fn, num_batches: int = 50):
+    """Compute validation loss over a fixed number of batches."""
+    model.eval()
+    total_loss = 0.0
+    total_acc = 0.0
+    count = 0
+    
+    with torch.no_grad():
+        for batch in val_dataloader:
+            if count >= num_batches:
+                break
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                output = model(
+                    input_ids=batch["input_ids"].to(device_id),
+                    attention_mask=batch["attention_mask"].to(device_id),
+                    pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                    labels=batch["labels"],
+                )
+            total_loss += output.loss.item()
+            
+            # Compute accuracy
+            action_logits = output.logits[:, get_model_fn().vision_backbone.featurizer.patch_embed.num_patches:-1]
+            action_preds = action_logits.argmax(dim=2)
+            action_gt = batch["labels"][:, 1:].to(action_preds.device)
+            mask = action_gt > action_tokenizer.action_token_begin_idx
+            acc = ((action_preds == action_gt) & mask).sum().float() / mask.sum().float()
+            total_acc += acc.item()
+            count += 1
+    
+    model.train()
+    return total_loss / max(count, 1), total_acc / max(count, 1)
 
 
 def run_validation(model, processor, cfg, task_suites, tracker, step, device_id, dataset_stats):
@@ -272,6 +306,20 @@ def finetune(cfg: FinetuneConfig) -> None:
     )
     dataloader = DataLoader(vla_dataset, batch_size=cfg.batch_size, collate_fn=collator, num_workers=0)
     
+    # Validation dataloader (no augmentation, smaller shuffle buffer)
+    val_batch_transform = RLDSBatchTransform(
+        action_tokenizer, processor.tokenizer,
+        image_transform=processor.image_processor.apply_transform,
+        prompt_builder_fn=PurePromptBuilder,
+    )
+    val_dataset = RLDSDataset(
+        cfg.data_root_dir, dataset_name, val_batch_transform,
+        resize_resolution=tuple(get_model().config.image_sizes),
+        shuffle_buffer_size=1000,
+        image_aug=False,
+    )
+    val_dataloader = DataLoader(val_dataset, batch_size=cfg.batch_size, collate_fn=collator, num_workers=0)
+    
     # Initialize trackers
     hparams = draccus.encode(cfg)
     tracker = TensorBoardTracker(exp_id, run_dir, hparams)
@@ -320,6 +368,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             
             # Optimizer step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+                # Compute gradient norm before optimizer step
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=float('inf'))
+                
                 optimizer.step()
                 optimizer.zero_grad()
                 pbar.update()
@@ -331,10 +382,11 @@ def finetune(cfg: FinetuneConfig) -> None:
                     tracker.write(step, {
                         "train/loss": avg_loss,
                         "train/action_accuracy": avg_acc,
+                        "train/grad_norm": grad_norm.item(),
                     })
                     if cfg.use_wandb:
                         import wandb
-                        wandb.log({"train/loss": avg_loss, "train/action_accuracy": avg_acc}, step=step)
+                        wandb.log({"train/loss": avg_loss, "train/action_accuracy": avg_acc, "train/grad_norm": grad_norm.item()}, step=step)
                     pbar.set_postfix(loss=f"{avg_loss:.4f}", acc=f"{avg_acc:.2%}")
             
             # Training rollouts
@@ -345,6 +397,20 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Validation
             if step > 0 and step % cfg.val_frequency == 0:
                 if distributed_state.is_main_process:
+                    # Compute validation loss
+                    val_loss, val_acc = compute_val_loss(
+                        vla, val_dataloader, device_id, action_tokenizer, get_model, cfg.val_loss_batches
+                    )
+                    tracker.write(step, {
+                        "val/loss": val_loss,
+                        "val/action_accuracy": val_acc,
+                    })
+                    if cfg.use_wandb:
+                        import wandb
+                        wandb.log({"val/loss": val_loss, "val/action_accuracy": val_acc}, step=step)
+                    print(f"\n[Step {step}] Val loss: {val_loss:.4f}, Val acc: {val_acc:.2%}")
+                    
+                    # Run validation rollouts
                     run_validation(vla, processor, cfg, task_suites, tracker, step, device_id, vla_dataset.dataset_statistics)
                 if use_ddp:
                     dist.barrier()
@@ -380,6 +446,17 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Final validation
     if distributed_state.is_main_process:
         print("\nRunning final validation...")
+        val_loss, val_acc = compute_val_loss(
+            vla, val_dataloader, device_id, action_tokenizer, get_model, cfg.val_loss_batches
+        )
+        tracker.write(cfg.max_steps, {
+            "val/loss": val_loss,
+            "val/action_accuracy": val_acc,
+        })
+        if cfg.use_wandb:
+            import wandb
+            wandb.log({"val/loss": val_loss, "val/action_accuracy": val_acc}, step=cfg.max_steps)
+        print(f"Final val loss: {val_loss:.4f}, Val acc: {val_acc:.2%}")
         run_validation(vla, processor, cfg, task_suites, tracker, cfg.max_steps, device_id, vla_dataset.dataset_statistics)
     
     tracker.finalize()
