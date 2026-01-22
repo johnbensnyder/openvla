@@ -62,7 +62,7 @@ class FinetuneConfig:
     vla_path: str = "openvla/openvla-7b"
     
     # Data
-    data_root_dir: Path = Path("datasets/modified_libero_rlds")
+    data_root_dir: str = "datasets/modified_libero_rlds"
     task_suites: str = "libero_spatial"  # Comma-separated list: libero_spatial,libero_object,libero_goal,libero_10
     
     # Output
