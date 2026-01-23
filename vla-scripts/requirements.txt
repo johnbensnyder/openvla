@@ -1,0 +1,79 @@
+# OpenVLA SageMaker Training Requirements
+# For use with: 763104351884.dkr.ecr.<region>.amazonaws.com/pytorch-training:2.9.0-gpu-py312-cu130-ubuntu22.04-sagemaker
+#
+# Excludes packages already in DLC: torch, torchvision, numpy, CUDA libs, etc.
+#
+# NOTE: Install dlimp separately first:
+#   pip install --no-deps git+https://github.com/kvablack/dlimp
+
+# Core ML/Training
+accelerate>=1.12.0
+peft>=0.18.1
+transformers==4.45.0
+safetensors>=0.7.0
+tokenizers>=0.20.3
+timm==0.9.16
+einops>=0.8.1
+
+# TensorFlow (for RLDS dataset loading)
+tensorflow>=2.20.0
+tensorflow-datasets>=4.9.9
+tensorflow-graphics>=2020.5.20
+tensorflow-metadata>=1.17.3
+
+# Data processing
+array-record>=0.8.3
+etils>=1.13.0
+dm-tree>=0.1.9
+pyarrow>=23.0.0
+h5py>=3.15.1
+
+# Robotics simulation
+libero==0.1.1
+robosuite>=1.4.0
+robomimic>=0.2.0
+mujoco>=3.4.0
+gymnasium>=1.2.3
+gym>=0.26.2
+bddl>=1.0.1
+
+# OpenGL/Rendering
+pyopengl>=3.1.10
+glfw>=2.10.0
+egl-probe>=1.0.2
+hf-egl-probe>=1.0.2
+
+# Visualization/Logging
+tensorboard>=2.20.0
+tensorboardx>=2.6.4
+matplotlib>=3.10.8
+imageio>=2.37.2
+imageio-ffmpeg>=0.6.0
+moviepy<2.0
+opencv-python>=4.13.0.90
+pillow>=11.0.0
+
+# Config/CLI
+draccus>=0.10.0
+hydra-core>=1.3.2
+omegaconf>=2.3.0
+pyyaml>=6.0.0
+click>=8.3.1
+
+# HuggingFace
+huggingface-hub>=0.36.0
+
+# Utilities
+tqdm>=4.67.1
+rich>=14.2.0
+cloudpickle>=3.1.2
+joblib>=1.5.3
+regex>=2024.0.0
+sentencepiece>=0.2.1
+nltk>=3.9.2
+
+# AWS (for S3 sync in SageMaker)
+boto3>=1.35.0
+
+# Optional: Weights & Biases
+wandb>=0.24.0

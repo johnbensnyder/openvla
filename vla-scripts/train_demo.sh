@@ -14,9 +14,12 @@ fi
 torchrun --standalone --nnodes 1 --nproc-per-node $NUM_GPUS vla-scripts/finetune_libero_demo.py \
   --data_root_dir "$DATA_DIR" \
   --task_suites libero_spatial \
-  --val_frequency 5000 \
-  --val_episodes 10 \
-  --num_videos 5 \
+  --val_frequency 0 \
+  --val_episodes 1 \
+  --num_videos 1 \
+  --dist_rollout_frequency 5000 \
   --train_rollout_frequency 0 \
   --batch_size 4 \
-  --save_steps 25000
+  --grad_accumulation_steps 4 \
+  --save_steps 5000 \
+  --max_steps 45000
